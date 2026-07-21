@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -22,24 +24,74 @@ type godaddyProvider struct {
 }
 
 type providerModel struct {
-	Key            types.String `tfsdk:"key"`
-	Secret         types.String `tfsdk:"secret"`
-	BaseURL        types.String `tfsdk:"base_url"`
-	RequestTimeout types.Int64  `tfsdk:"request_timeout_ms"`
-	MaxRetries     types.Int64  `tfsdk:"max_retries"`
-	BaseBackoffMS  types.Int64  `tfsdk:"base_backoff_ms"`
-	MaxBackoffMS   types.Int64  `tfsdk:"max_backoff_ms"`
+	Key               types.String `tfsdk:"key"`
+	Secret            types.String `tfsdk:"secret"`
+	BaseURL           types.String `tfsdk:"base_url"`
+	RequestTimeout    types.Int64  `tfsdk:"request_timeout_ms"`
+	MaxRetries        types.Int64  `tfsdk:"max_retries"`
+	BaseBackoffMS     types.Int64  `tfsdk:"base_backoff_ms"`
+	MaxBackoffMS      types.Int64  `tfsdk:"max_backoff_ms"`
+	RequestsPerMinute types.Int64  `tfsdk:"requests_per_minute"`
 }
 
 type providerConfig struct {
-	Key           string
-	Secret        string
-	BaseURL       string
-	Timeout       time.Duration
-	MaxRetries    int
-	BaseBackoffMS int
-	MaxBackoffMS  int
-	HTTPClient    *http.Client
+	Key            string
+	Secret         string
+	BaseURL        string
+	Timeout        time.Duration
+	MaxRetries     int
+	BaseBackoffMS  int
+	MaxBackoffMS   int
+	HTTPClient     *http.Client
+	RequestLimiter *requestLimiter
+}
+
+const defaultRequestsPerMinute int64 = 40
+
+// requestLimiter spaces all requests made by one configured provider instance.
+// Terraform can refresh resources concurrently, while the GoDaddy API enforces a
+// shared request limit. Reserving the next slot before waiting keeps requests
+// ordered without holding the mutex during the delay.
+type requestLimiter struct {
+	interval time.Duration
+	mu       sync.Mutex
+	next     time.Time
+}
+
+func newRequestLimiter(requestsPerMinute int64) *requestLimiter {
+	if requestsPerMinute < 1 {
+		requestsPerMinute = defaultRequestsPerMinute
+	}
+	return &requestLimiter{interval: time.Minute / time.Duration(requestsPerMinute)}
+}
+
+func (l *requestLimiter) Wait(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+
+	now := time.Now()
+	l.mu.Lock()
+	scheduled := now
+	if l.next.After(scheduled) {
+		scheduled = l.next
+	}
+	l.next = scheduled.Add(l.interval)
+	l.mu.Unlock()
+
+	delay := time.Until(scheduled)
+	if delay <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func New(version string) func() provider.Provider {
@@ -56,13 +108,14 @@ func (p *godaddyProvider) Metadata(_ context.Context, _ provider.MetadataRequest
 func (p *godaddyProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		Attributes: map[string]schema.Attribute{
-			"key":                schema.StringAttribute{Optional: true, Sensitive: true},
-			"secret":             schema.StringAttribute{Optional: true, Sensitive: true},
-			"base_url":           schema.StringAttribute{Optional: true},
-			"request_timeout_ms": schema.Int64Attribute{Optional: true},
-			"max_retries":        schema.Int64Attribute{Optional: true},
-			"base_backoff_ms":    schema.Int64Attribute{Optional: true},
-			"max_backoff_ms":     schema.Int64Attribute{Optional: true},
+			"key":                 schema.StringAttribute{Optional: true, Sensitive: true},
+			"secret":              schema.StringAttribute{Optional: true, Sensitive: true},
+			"base_url":            schema.StringAttribute{Optional: true},
+			"request_timeout_ms":  schema.Int64Attribute{Optional: true},
+			"max_retries":         schema.Int64Attribute{Optional: true},
+			"base_backoff_ms":     schema.Int64Attribute{Optional: true},
+			"max_backoff_ms":      schema.Int64Attribute{Optional: true},
+			"requests_per_minute": schema.Int64Attribute{Optional: true},
 		},
 	}
 }
@@ -98,6 +151,7 @@ func (p *godaddyProvider) Configure(ctx context.Context, req provider.ConfigureR
 	maxRetries := int64Or(cfg.MaxRetries.ValueInt64(), 4)
 	baseBackoff := int64Or(cfg.BaseBackoffMS.ValueInt64(), 300)
 	maxBackoff := int64Or(cfg.MaxBackoffMS.ValueInt64(), 5000)
+	requestsPerMinute := int64Or(cfg.RequestsPerMinute.ValueInt64(), int64Env(defaultRequestsPerMinute, "GODADDY_REQUESTS_PER_MINUTE"))
 
 	if timeoutMS < 1000 {
 		timeoutMS = 1000
@@ -113,14 +167,15 @@ func (p *godaddyProvider) Configure(ctx context.Context, req provider.ConfigureR
 	}
 
 	pc := &providerConfig{
-		Key:           key,
-		Secret:        secret,
-		BaseURL:       baseURL,
-		Timeout:       time.Duration(timeoutMS) * time.Millisecond,
-		MaxRetries:    int(maxRetries),
-		BaseBackoffMS: int(baseBackoff),
-		MaxBackoffMS:  int(maxBackoff),
-		HTTPClient:    &http.Client{Timeout: time.Duration(timeoutMS) * time.Millisecond},
+		Key:            key,
+		Secret:         secret,
+		BaseURL:        baseURL,
+		Timeout:        time.Duration(timeoutMS) * time.Millisecond,
+		MaxRetries:     int(maxRetries),
+		BaseBackoffMS:  int(baseBackoff),
+		MaxBackoffMS:   int(maxBackoff),
+		HTTPClient:     &http.Client{Timeout: time.Duration(timeoutMS) * time.Millisecond},
+		RequestLimiter: newRequestLimiter(requestsPerMinute),
 	}
 
 	resp.ResourceData = pc
@@ -151,6 +206,17 @@ func envOr(v string, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func int64Env(fallback int64, keys ...string) int64 {
+	for _, k := range keys {
+		if raw := os.Getenv(k); raw != "" {
+			if value, err := strconv.ParseInt(raw, 10, 64); err == nil && value > 0 {
+				return value
+			}
+		}
+	}
+	return fallback
 }
 
 func (c *providerConfig) authHeader() string {

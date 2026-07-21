@@ -193,6 +193,9 @@ func (r *domainRecordResource) doJSON(ctx context.Context, method, endpoint stri
 	attempt := 0
 	for {
 		attempt++
+		if err := r.cfg.RequestLimiter.Wait(ctx); err != nil {
+			return 0, "", err
+		}
 
 		var reqBody *bytes.Reader
 		if body != nil {
